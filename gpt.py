@@ -60,16 +60,22 @@ class RotaryPositionEmbedding(nn.Module):
 		inv_freq = jnp.concatenate((inv_freq, jnp.zeros(self.dim // 4)))
 		t = jnp.arange(self.max_seq_len, dtype=jnp.float32)
 		theta = jnp.einsum("i,j->ij", t, inv_freq)
-		self.cos, self.sin = jnp.cos(theta), jnp.sin(theta)
+		self.cos = jnp.cos(theta)
+		self.sin = jnp.sin(theta)
 
-	def __call__(self, x: jax.Array) -> jax.Array:
-		cos = self.cos[None, :x.shape[1], None, :]
-		sin = self.sin[None, :x.shape[1], None, :]
+	def rotate(self, x: jax.Array) -> jax.Array:
 		x1, x2 = jnp.split(x, 2, axis=-1)
+		x1 = jnp.reshape(x1, (x1.shape[0] * x1.shape[1], -1, x1.shape[-1]))
+		x2 = jnp.reshape(x2, (x2.shape[0] * x2.shape[1], -1, x2.shape[-1]))
+		cos = self.cos[:x.shape[1], None]
+		sin = self.sin[:x.shape[1], None]
 		return jnp.concatenate([
-			x1 * cos + x2 * sin,
-			x1 * -sin + x2 * cos
-		], axis=-1)
+				x1 * cos + x2 * sin,
+				x1 * -sin + x2 * cos
+			], axis=-1).reshape(x.shape)
+
+	def __call__(self, q: jax.Array, k: jax.Array) -> jax.Array:
+		return self.rotate(q), self.rotate(k)
 
 
 class GroupedQueryAttention(nn.Module):
@@ -78,6 +84,7 @@ class GroupedQueryAttention(nn.Module):
 	n_kv_heads: int
 	head_dim: int
 	sliding_window: int
+	max_seq_length: int
 
 	@nn.compact
 	def __call__(self, x: jax.Array) -> jax.Array:
@@ -87,8 +94,10 @@ class GroupedQueryAttention(nn.Module):
 
 		proj = nn.Dense((self.n_q_heads + 2 * self.n_kv_heads) * self.head_dim, use_bias=False)(x)
 		q, k, v = jnp.split(proj, (self.n_q_heads * self.head_dim, (self.n_q_heads + self.n_kv_heads) * self.head_dim), axis=-1)
-		q = RotaryPositionEmbedding(self.head_dim, L)(q.reshape(B, L, self.n_kv_heads, QM, self.head_dim))
-		k = RotaryPositionEmbedding(self.head_dim, L)(k.reshape(B, L, self.n_kv_heads, self.head_dim))
+		q, k = RotaryPositionEmbedding(self.head_dim, self.max_seq_length)(
+			q.reshape(B, L, self.n_kv_heads, QM, self.head_dim),
+			k.reshape(B, L, self.n_kv_heads, self.head_dim)
+		)
 		v = v.reshape(B, L, self.n_kv_heads, self.head_dim)
 
 		sm_scale = 1 / jnp.sqrt(self.head_dim)
@@ -129,6 +138,7 @@ class GPT(nn.Module):
 	n_kv_heads: int
 	head_dim: int
 	sliding_window: int
+	max_seq_length: int
 	n_experts: int
 	n_experts_per_tok: int
 	ffw_size: int
@@ -138,7 +148,7 @@ class GPT(nn.Module):
 	@nn.compact
 	def __call__(self, x: jax.Array) -> jax.Array:
 		x = nn.Sequential([*(nn.Sequential([
-				ResidualPreNorm(GroupedQueryAttention(i, self.n_q_heads, self.n_kv_heads, self.head_dim, self.sliding_window)),
+				ResidualPreNorm(GroupedQueryAttention(i, self.n_q_heads, self.n_kv_heads, self.head_dim, self.sliding_window, self.max_seq_length)),
 				ResidualPreNorm(MoE(self.n_experts, self.n_experts_per_tok, self.ffw_size, self.swiglu_limit))
 			]) for i in range(self.depth))])(x)
 		x = nn.RMSNorm(1e-05)(x)
