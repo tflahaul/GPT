@@ -1,6 +1,7 @@
 import jax
 
 from functools import partial
+from typing import Tuple
 from flax import linen as nn
 from jax import numpy as jnp
 
@@ -26,8 +27,8 @@ def sdpa(
 	sliding_window: int = 0
 ) -> jax.Array:
 	B, L, H, M, D = q.shape
-	k = jnp.broadcast_to(k[:, :, :, None], (B, L, H, M, D))
-	v = jnp.broadcast_to(v[:, :, :, None], (B, L, H, M, D))
+	k = jnp.broadcast_to(k[:, :, :, None, :], (B, L, H, M, D))
+	v = jnp.broadcast_to(v[:, :, :, None, :], (B, L, H, M, D))
 
 	q_pos, k_pos = jnp.arange(L)[None, :, None], jnp.arange(L)[None, None, :]
 	mask = nn.combine_masks(
@@ -36,7 +37,7 @@ def sdpa(
 	)
 	attn = jnp.einsum("bqhmd,bkhmd->bhmqk", q, k) * sm_scale
 	attn = jnp.where(mask, -jnp.inf, attn)
-	sink = jnp.broadcast_to(s[..., None, None], attn.shape[:-1] + (1,))
+	sink = jnp.broadcast_to(s.reshape(B, H, M, 1, 1), (B, H, M, L, 1))
 	w = jax.nn.softmax(jnp.concatenate([attn, sink], axis=-1))
 	w = w[..., :-1]
 	out = jnp.einsum("bhmqk,bkhmd->bqhmd", w, v)
@@ -52,24 +53,32 @@ class ResidualPreNorm(nn.Module):
 
 
 class RotaryPositionEmbedding(nn.Module):
+	""" half-truncate rotary position embedding for efficiency """
 	dim: int
 	max_seq_len: int
+	base: int = 1024
 
 	def setup(self) -> None:
-		inv_freq = (1 / 1024) ** jnp.linspace(0, 1, num=(self.dim // 4))
-		inv_freq = jnp.concatenate((inv_freq, jnp.zeros(self.dim // 4)))
+		freqs = (1 / self.base) ** jnp.linspace(0, 1, num=(self.dim // 4))
+		freqs = jnp.concatenate((freqs, jnp.zeros(self.dim // 4)))
 		t = jnp.arange(self.max_seq_len, dtype=jnp.float32)
-		theta = jnp.einsum("i,j->ij", t, inv_freq)
-		self.cos, self.sin = jnp.cos(theta), jnp.sin(theta)
+		theta = jnp.einsum("i,j->ij", t, freqs)
+		self.cos_cached = jnp.expand_dims(jnp.cos(theta), (0, 2))
+		self.sin_cached = jnp.expand_dims(jnp.sin(theta), (0, 2))
 
-	def __call__(self, x: jax.Array) -> jax.Array:
-		cos = self.cos[None, :x.shape[1], None, :]
-		sin = self.sin[None, :x.shape[1], None, :]
+	def rotate(self, x: jax.Array) -> jax.Array:
+		cos = self.cos_cached[:, :x.shape[1]]
+		sin = self.sin_cached[:, :x.shape[1]]
 		x1, x2 = jnp.split(x, 2, axis=-1)
-		return jnp.concatenate([
-			x1 * cos + x2 * sin,
-			x1 * -sin + x2 * cos
-		], axis=-1)
+		y1 = x1 * cos + x2 * sin
+		y2 = x1 * -sin + x2 * cos
+		return jnp.concatenate((y1, y2), axis=-1)
+
+	def __call__(self, q: jax.Array, k: jax.Array) -> Tuple[jax.Array, jax.Array]:
+		B, L, H, QM, D = q.shape
+		q = self.rotate(jnp.reshape(q, (B, L, -1, D))).reshape((B, L, H, QM, D))
+		k = self.rotate(k)
+		return q, k
 
 
 class GroupedQueryAttention(nn.Module):
@@ -78,17 +87,20 @@ class GroupedQueryAttention(nn.Module):
 	n_kv_heads: int
 	head_dim: int
 	sliding_window: int
+	max_seq_length: int
 
 	@nn.compact
 	def __call__(self, x: jax.Array) -> jax.Array:
 		B, L, D = x.shape
 		QM = self.n_q_heads // self.n_kv_heads
-		s = self.param("S", nn.initializers.zeros, (1, self.n_kv_heads, QM))
+		s = self.param("S", nn.initializers.zeros, (1, self.n_q_heads))
 
 		proj = nn.Dense((self.n_q_heads + 2 * self.n_kv_heads) * self.head_dim, use_bias=False)(x)
 		q, k, v = jnp.split(proj, (self.n_q_heads * self.head_dim, (self.n_q_heads + self.n_kv_heads) * self.head_dim), axis=-1)
-		q = RotaryPositionEmbedding(self.head_dim, L)(q.reshape(B, L, self.n_kv_heads, QM, self.head_dim))
-		k = RotaryPositionEmbedding(self.head_dim, L)(k.reshape(B, L, self.n_kv_heads, self.head_dim))
+		q, k = RotaryPositionEmbedding(self.head_dim, self.max_seq_length)(
+			q.reshape(B, L, self.n_kv_heads, QM, self.head_dim),
+			k.reshape(B, L, self.n_kv_heads, self.head_dim)
+		)
 		v = v.reshape(B, L, self.n_kv_heads, self.head_dim)
 
 		sm_scale = 1 / jnp.sqrt(self.head_dim)
@@ -129,6 +141,7 @@ class GPT(nn.Module):
 	n_kv_heads: int
 	head_dim: int
 	sliding_window: int
+	max_seq_length: int
 	n_experts: int
 	n_experts_per_tok: int
 	ffw_size: int
@@ -137,10 +150,12 @@ class GPT(nn.Module):
 
 	@nn.compact
 	def __call__(self, x: jax.Array) -> jax.Array:
+		embedding = self.param("Embedding", nn.linear.default_embed_init, (self.out_size, self.ffw_size))
+		x = jnp.take(embedding, x, axis=0)
 		x = nn.Sequential([*(nn.Sequential([
-				ResidualPreNorm(GroupedQueryAttention(i, self.n_q_heads, self.n_kv_heads, self.head_dim, self.sliding_window)),
+				ResidualPreNorm(GroupedQueryAttention(i, self.n_q_heads, self.n_kv_heads, self.head_dim, self.sliding_window, self.max_seq_length)),
 				ResidualPreNorm(MoE(self.n_experts, self.n_experts_per_tok, self.ffw_size, self.swiglu_limit))
 			]) for i in range(self.depth))])(x)
 		x = nn.RMSNorm(1e-05)(x)
-		x = nn.Dense(self.out_size, use_bias=False)(x)
+		x = x @ embedding.T  # inverse embedding
 		return x
