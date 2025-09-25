@@ -1,6 +1,7 @@
 import jax
 
 from functools import partial
+from typing import Tuple
 from flax import linen as nn
 from jax import numpy as jnp
 
@@ -52,29 +53,28 @@ class ResidualPreNorm(nn.Module):
 
 
 class RotaryPositionEmbedding(nn.Module):
+	""" half-truncate rotary position embedding for efficiency """
 	dim: int
 	max_seq_len: int
+	base: int = 1024
 
 	def setup(self) -> None:
-		inv_freq = (1 / 1024) ** jnp.linspace(0, 1, num=(self.dim // 4))
-		inv_freq = jnp.concatenate((inv_freq, jnp.zeros(self.dim // 4)))
+		freqs = (1 / self.base) ** jnp.linspace(0, 1, num=(self.dim // 4))
+		freqs = jnp.concatenate((freqs, jnp.zeros(self.dim // 4)))
 		t = jnp.arange(self.max_seq_len, dtype=jnp.float32)
-		theta = jnp.einsum("i,j->ij", t, inv_freq)
-		self.cos = jnp.cos(theta)
-		self.sin = jnp.sin(theta)
+		theta = jnp.einsum("i,j->ij", t, freqs)
+		self.cos_cached = jnp.expand_dims(jnp.cos(theta), (0, 2))
+		self.sin_cached = jnp.expand_dims(jnp.sin(theta), (0, 2))
 
 	def rotate(self, x: jax.Array) -> jax.Array:
+		cos = self.cos_cached[:, :x.shape[1]]
+		sin = self.sin_cached[:, :x.shape[1]]
 		x1, x2 = jnp.split(x, 2, axis=-1)
-		x1 = jnp.reshape(x1, (x1.shape[0] * x1.shape[1], -1, x1.shape[-1]))
-		x2 = jnp.reshape(x2, (x2.shape[0] * x2.shape[1], -1, x2.shape[-1]))
-		cos = self.cos[:x.shape[1], None]
-		sin = self.sin[:x.shape[1], None]
-		return jnp.concatenate([
-				x1 * cos + x2 * sin,
-				x1 * -sin + x2 * cos
-			], axis=-1).reshape(x.shape)
+		y1 = x1 * cos + x2 * sin
+		y2 = x1 * -sin + x2 * cos
+		return jnp.concatenate((y1, y2), axis=-1)
 
-	def __call__(self, q: jax.Array, k: jax.Array) -> jax.Array:
+	def __call__(self, q: jax.Array, k: jax.Array) -> Tuple[jax.Array, jax.Array]:
 		return self.rotate(q), self.rotate(k)
 
 
